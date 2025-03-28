@@ -1,0 +1,24 @@
+[package]
+name = "crate-mcp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mcp-sdk = { git = "https://github.com/AntigmaLabs/mcp-sdk" }
+anyhow = "1"
+serde_json = "1"
+tracing-subscriber = "0.3"
+tracing = "0.1"
+tokio = { version = "1", features = ["full"] }
+
+cargo_metadata = "0.19.1"
+cargo-lock = "10.1" 
+home = "0.5.11" 
+rustdoc-json = { version = "0.9.5" }
+public-api = { version = "0.44.2" } 
+rustup-toolchain = { version = "0.1.10"}
+rustdoc-types = "0.35.0"
+tempfile = "3.10.1"
+tempdir = "0.3.7"
+regex = "1.10.5"
+cargo = "0.86"
