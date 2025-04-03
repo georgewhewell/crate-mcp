@@ -6,18 +6,129 @@ use anyhow::{Context, Result, anyhow};
 use cargo::GlobalContext;
 use cargo::core::{PackageSet, Resolve, Workspace};
 use cargo::util::StableHasher;
-use mcp_sdk::server::Server;
-use mcp_sdk::transport::ServerStdioTransport;
-use mcp_sdk::types::{
-    CallToolRequest, CallToolResponse, ListRequest, ResourcesListResponse, ServerCapabilities,
-    ToolResponseContent, ToolsListResponse,
-};
+use rmcp::{Error as McpError, ServerHandler, ServiceExt, transport::stdio, model::*, tool, schemars};
 use regex::Regex;
 use rustdoc_types::Id;
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
 
 use std::hash::Hash;
+
+// Define request struct for crate_api
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct CrateApiRequest {
+    #[schemars(description = "The name of the crate dependency")]
+    crate_name: String,
+    
+    #[schemars(description = "Path to the Cargo.toml file")]
+    #[serde(default)]
+    manifest_path: Option<String>,
+    
+    #[schemars(description = "Optional regex pattern to filter items")]
+    #[serde(default)]
+    item_filter: Option<String>,
+    
+    #[schemars(description = "Whether to include doc comments")]
+    #[serde(default = "default_true")]
+    include_doc_comments: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ListCratesRequest {
+    #[schemars(description = "Path to the Cargo.toml file")]
+    #[serde(default)]
+    manifest_path: Option<String>,
+}
+
+fn default_true() -> Option<bool> {
+    Some(true)
+}
+
+#[derive(Clone)]
+struct CrateMcp;
+
+#[tool(tool_box)]
+impl CrateMcp {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[tool(description = "Lists all dependencies found in the Cargo.lock file")]
+    fn list_crates(&self, #[tool(aggr)] req: ListCratesRequest) -> Result<CallToolResult, McpError> {
+        let manifest_path_str = req.manifest_path.unwrap_or_else(|| "./Cargo.toml".to_string());
+        let manifest_path = PathBuf::from(manifest_path_str);
+        let lock_path = manifest_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("Cargo.lock");
+
+        let lockfile = match cargo_lock::Lockfile::load(&lock_path) {
+            Ok(lockfile) => lockfile,
+            Err(e) => return Err(McpError::internal_error("failed_to_load_lockfile", 
+                Some(json!({"error": e.to_string()}))))
+        };
+
+        let mut crate_list = String::new();
+        // Sort packages for deterministic output
+        let mut packages: Vec<_> = lockfile.packages.iter().collect();
+        packages.sort_unstable_by_key(|p| p.name.as_str());
+
+        for package in packages {
+            crate_list.push_str(&format!("{} v{}\n", package.name.as_str(), package.version));
+        }
+        
+        Ok(CallToolResult::success(vec![Content::text(crate_list)]))
+    }
+
+    #[tool(description = "Generates the public API listing for a specific crate dependency")]
+    fn crate_public_api(&self, #[tool(aggr)] req: CrateApiRequest) -> Result<CallToolResult, McpError> {
+        let manifest_path_str = req.manifest_path.unwrap_or_else(|| "./Cargo.toml".to_string());
+        let manifest_path = match PathBuf::from(manifest_path_str).canonicalize() {
+            Ok(p) => p,
+            Err(e) => return Err(McpError::internal_error(
+                "canonicalize_failed", 
+                Some(json!({"error": e.to_string()}))))
+        };
+        
+        let include_doc_comments = req.include_doc_comments.unwrap_or(true);
+            
+        let gctx = match cargo::util::context::GlobalContext::default() {
+            Ok(ctx) => ctx,
+            Err(e) => return Err(McpError::internal_error(
+                "cargo_context_failed", 
+                Some(json!({"error": e.to_string()}))))
+        };
+        
+        let api_text = match generate_crate_public_api(
+            &gctx,
+            &req.crate_name,
+            &manifest_path,
+            req.item_filter.as_deref(),
+            include_doc_comments,
+        ) {
+            Ok(text) => text,
+            Err(e) => return Err(McpError::internal_error(
+                "api_generation_failed", 
+                Some(json!({"error": e.to_string()}))))
+        };
+        
+        Ok(CallToolResult::success(vec![Content::text(api_text)]))
+    }
+}
+
+#[tool(tool_box)]
+impl ServerHandler for CrateMcp {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo {
+            protocol_version: ProtocolVersion::V_2024_11_05,
+            capabilities: ServerCapabilities::builder()
+                .enable_tools()
+                .build(),
+            server_info: Implementation::from_build_env(),
+            instructions: Some("This server provides tools for working with Rust crates.".to_string()),
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -28,91 +139,12 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let server = Server::builder(ServerStdioTransport)
-        .capabilities(ServerCapabilities {
-            tools: Some(json!({})),
-            ..Default::default()
-        })
-        .request_handler("tools/list", list_tools)
-        .request_handler("tools/call", |req: CallToolRequest| {
-            let name = req.name.clone();
-            call_tool(req).map_err(|e| anyhow::anyhow!("Error calling tool {1}: {:#}", e, name))
-        })
-        .request_handler("resources/list", |_req: ListRequest| {
-            Ok(ResourcesListResponse {
-                resources: vec![],
-                next_cursor: None,
-                meta: None,
-            })
-        })
-        .build();
-    let server_handle = {
-        let server = server;
-        tokio::spawn(async move { server.listen().await })
-    };
-
-    server_handle
-        .await?
-        .map_err(|e| anyhow::anyhow!("Server error: {}", e))?;
+    let service = CrateMcp::new().serve(stdio()).await
+        .map_err(|e| anyhow!("Failed to serve: {}", e))?;
+    
+    service.waiting().await
+        .map_err(|e| anyhow!("Service error: {}", e))?;
     Ok(())
-}
-
-fn call_tool(req: CallToolRequest) -> Result<CallToolResponse> {
-    let name = req.name.as_str();
-    let args = req.arguments.unwrap_or_default();
-    let result = match name {
-        "list_crates" => {
-            let manifest_path_str = args["manifest_path"].as_str().unwrap_or("./Cargo.toml");
-            let manifest_path = PathBuf::from(manifest_path_str);
-            let lock_path = manifest_path
-                .parent()
-                .unwrap_or(Path::new("."))
-                .join("Cargo.lock");
-
-            let lockfile = cargo_lock::Lockfile::load(&lock_path)
-                .with_context(|| format!("Failed to load lockfile at {lock_path:?}"))?;
-
-            let mut crate_list = String::new();
-            // Sort packages for deterministic output
-            let mut packages: Vec<_> = lockfile.packages.iter().collect();
-            packages.sort_unstable_by_key(|p| p.name.as_str());
-
-            for package in packages {
-                crate_list.push_str(&format!("{} v{}\n", package.name.as_str(), package.version));
-            }
-            ToolResponseContent::Text { text: crate_list }
-        }
-        "crate_public_api" => {
-            let gctx = cargo::util::context::GlobalContext::default()?;
-            // Optionally configure verbosity, color etc. if needed based on req or defaults
-            // gctx.configure(...)?;
-
-            let crate_name = args["crate_name"]
-                .as_str()
-                .context("Missing required argument 'crate_name'")?;
-            let manifest_path_str = args["manifest_path"].as_str().unwrap_or("./Cargo.toml");
-            let manifest_path = PathBuf::from(manifest_path_str)
-                .canonicalize()
-                .context("Canonicalizing manifest path")?;
-            let item_filter_pattern = args["item_filter"].as_str();
-            let include_doc_comments = args["include_doc_comments"].as_bool().unwrap_or(true);
-
-            let api_text = generate_crate_public_api(
-                &gctx, // Pass gctx
-                crate_name,
-                &manifest_path,
-                item_filter_pattern,
-                include_doc_comments,
-            )?;
-            ToolResponseContent::Text { text: api_text }
-        }
-        _ => return Err(anyhow!("Unsupported tool name: {name}")),
-    };
-    Ok(CallToolResponse {
-        content: vec![result],
-        is_error: None,
-        meta: None,
-    })
 }
 
 fn find_crate_src_path(
@@ -286,57 +318,4 @@ fn generate_crate_public_api(
     // No explicit cleanup of build_target_dir needed, let Cargo manage it.
 
     Ok(output)
-}
-
-fn list_tools(_req: ListRequest) -> Result<ToolsListResponse> {
-    let response = json!({
-      "tools": [
-     {  "name": "list_crates",
-        "description":
-          "Lists all dependencies (package name and version) found in the Cargo.lock file relative to the specified manifest path (defaults to ./Cargo.toml).",
-        "inputSchema": {
-          "type": "object",
-          "properties": {
-            "manifest_path": {
-              "type": "string",
-              "description": "Path to the Cargo.toml file. Defaults to './Cargo.toml'. The Cargo.lock in the same directory will be used.",
-              "nullable": true
-            }
-          }
-        }
-      },
-      {
-        "name": "crate_public_api",
-        "description":
-          "Generates the public API listing for a specific crate dependency found in the Cargo registry cache. Requires the crate version to be present in the project's Cargo.lock.",
-        "inputSchema": {
-          "type": "object",
-          "properties": {
-            "crate_name": {
-              "type": "string",
-              "description": "The name of the crate dependency (as used in Cargo.toml or Cargo.lock)."
-            },
-            "manifest_path": {
-                "type": "string",
-                "description": "Path to the Cargo.toml file of the *host* project (used to find Cargo.lock and crate version). Defaults to './Cargo.toml'.",
-                "nullable": true
-            },
-            "item_filter": {
-              "type": "string",
-              "description": "Optional regex pattern to filter the output items. Only items whose full string representation matches the pattern will be included.",
-              "nullable": true
-            },
-            "include_doc_comments": {
-              "type": "boolean",
-              "description": "Whether to include documentation comments in the output. Defaults to true.",
-              "nullable": true,
-              "default": true
-            }
-          },
-          "required": ["crate_name"]
-        }
-      },
-      ],
-    });
-    Ok(serde_json::from_value(response)?)
 }
