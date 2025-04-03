@@ -6,8 +6,10 @@ use anyhow::{Context, Result, anyhow};
 use cargo::GlobalContext;
 use cargo::core::{PackageSet, Resolve, Workspace};
 use cargo::util::StableHasher;
-use rmcp::{Error as McpError, ServerHandler, ServiceExt, transport::stdio, model::*, tool, schemars};
 use regex::Regex;
+use rmcp::{
+    Error as McpError, ServerHandler, ServiceExt, model::*, schemars, tool, transport::stdio,
+};
 use rustdoc_types::Id;
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
@@ -19,15 +21,15 @@ use std::hash::Hash;
 struct CrateApiRequest {
     #[schemars(description = "The name of the crate dependency")]
     crate_name: String,
-    
+
     #[schemars(description = "Path to the Cargo.toml file")]
     #[serde(default)]
     manifest_path: Option<String>,
-    
+
     #[schemars(description = "Optional regex pattern to filter items")]
     #[serde(default)]
     item_filter: Option<String>,
-    
+
     #[schemars(description = "Whether to include doc comments")]
     #[serde(default = "default_true")]
     include_doc_comments: Option<bool>,
@@ -54,8 +56,13 @@ impl CrateMcp {
     }
 
     #[tool(description = "Lists all dependencies found in the Cargo.lock file")]
-    fn list_crates(&self, #[tool(aggr)] req: ListCratesRequest) -> Result<CallToolResult, McpError> {
-        let manifest_path_str = req.manifest_path.unwrap_or_else(|| "./Cargo.toml".to_string());
+    fn list_crates(
+        &self,
+        #[tool(aggr)] req: ListCratesRequest,
+    ) -> Result<CallToolResult, McpError> {
+        let manifest_path_str = req
+            .manifest_path
+            .unwrap_or_else(|| "./Cargo.toml".to_string());
         let manifest_path = PathBuf::from(manifest_path_str);
         let lock_path = manifest_path
             .parent()
@@ -64,8 +71,12 @@ impl CrateMcp {
 
         let lockfile = match cargo_lock::Lockfile::load(&lock_path) {
             Ok(lockfile) => lockfile,
-            Err(e) => return Err(McpError::internal_error("failed_to_load_lockfile", 
-                Some(json!({"error": e.to_string()}))))
+            Err(e) => {
+                return Err(McpError::internal_error(
+                    "failed_to_load_lockfile",
+                    Some(json!({"error": e.to_string()})),
+                ));
+            }
         };
 
         let mut crate_list = String::new();
@@ -76,29 +87,40 @@ impl CrateMcp {
         for package in packages {
             crate_list.push_str(&format!("{} v{}\n", package.name.as_str(), package.version));
         }
-        
+
         Ok(CallToolResult::success(vec![Content::text(crate_list)]))
     }
 
     #[tool(description = "Generates the public API listing for a specific crate dependency")]
-    fn crate_public_api(&self, #[tool(aggr)] req: CrateApiRequest) -> Result<CallToolResult, McpError> {
-        let manifest_path_str = req.manifest_path.unwrap_or_else(|| "./Cargo.toml".to_string());
+    fn crate_public_api(
+        &self,
+        #[tool(aggr)] req: CrateApiRequest,
+    ) -> Result<CallToolResult, McpError> {
+        let manifest_path_str = req
+            .manifest_path
+            .unwrap_or_else(|| "./Cargo.toml".to_string());
         let manifest_path = match PathBuf::from(manifest_path_str).canonicalize() {
             Ok(p) => p,
-            Err(e) => return Err(McpError::internal_error(
-                "canonicalize_failed", 
-                Some(json!({"error": e.to_string()}))))
+            Err(e) => {
+                return Err(McpError::internal_error(
+                    "canonicalize_failed",
+                    Some(json!({"error": e.to_string()})),
+                ));
+            }
         };
-        
+
         let include_doc_comments = req.include_doc_comments.unwrap_or(true);
-            
+
         let gctx = match cargo::util::context::GlobalContext::default() {
             Ok(ctx) => ctx,
-            Err(e) => return Err(McpError::internal_error(
-                "cargo_context_failed", 
-                Some(json!({"error": e.to_string()}))))
+            Err(e) => {
+                return Err(McpError::internal_error(
+                    "cargo_context_failed",
+                    Some(json!({"error": e.to_string()})),
+                ));
+            }
         };
-        
+
         let api_text = match generate_crate_public_api(
             &gctx,
             &req.crate_name,
@@ -107,11 +129,14 @@ impl CrateMcp {
             include_doc_comments,
         ) {
             Ok(text) => text,
-            Err(e) => return Err(McpError::internal_error(
-                "api_generation_failed", 
-                Some(json!({"error": e.to_string()}))))
+            Err(e) => {
+                return Err(McpError::internal_error(
+                    "api_generation_failed",
+                    Some(json!({"error": e.to_string()})),
+                ));
+            }
         };
-        
+
         Ok(CallToolResult::success(vec![Content::text(api_text)]))
     }
 }
@@ -121,11 +146,9 @@ impl ServerHandler for CrateMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             protocol_version: ProtocolVersion::V_2024_11_05,
-            capabilities: ServerCapabilities::builder()
-                .enable_tools()
-                .build(),
+            capabilities: ServerCapabilities::builder().enable_tools().build(),
             server_info: Implementation::from_build_env(),
-            instructions: Some("This server provides tools for working with Rust crates.".to_string()),
+            instructions: Some("Tools for inspecting public API of rust crates.".to_string()),
         }
     }
 }
@@ -139,10 +162,14 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let service = CrateMcp::new().serve(stdio()).await
+    let service = CrateMcp::new()
+        .serve(stdio())
+        .await
         .map_err(|e| anyhow!("Failed to serve: {}", e))?;
-    
-    service.waiting().await
+
+    service
+        .waiting()
+        .await
         .map_err(|e| anyhow!("Service error: {}", e))?;
     Ok(())
 }
